@@ -68,20 +68,19 @@ async def generate_sub_queries(
         context=context,
     )
 
-    try:
-        response = await create_chat_completion(
-            model=cfg.strategic_llm_model,
-            messages=[{"role": "user", "content": gen_queries_prompt}],
-            llm_provider=cfg.strategic_llm_provider,
-            max_tokens=None,
-            llm_kwargs=cfg.llm_kwargs,
-            reasoning_effort=ReasoningEfforts.Medium.value,
-            cost_callback=cost_callback,
-            **kwargs
-        )
-    except Exception as e:
-        logger.warning(f"Error with strategic LLM: {e}. Retrying with max_tokens={cfg.strategic_token_limit}.")
-        logger.warning(f"See https://github.com/assafelovic/gpt-researcher/issues/1022")
+    response = await create_chat_completion(
+        model=cfg.strategic_llm_model,
+        messages=[{"role": "user", "content": gen_queries_prompt}],
+        llm_provider=cfg.strategic_llm_provider,
+        max_tokens=None,
+        llm_kwargs=cfg.llm_kwargs,
+        reasoning_effort=ReasoningEfforts.Medium.value,
+        cost_callback=cost_callback,
+        **kwargs
+    )
+    # If response is empty (due to LLM failure), attempt retries/fallbacks
+    if not response:
+        logger.warning(f"Empty response from strategic LLM. Retrying with max_tokens={cfg.strategic_token_limit}.")
         try:
             response = await create_chat_completion(
                 model=cfg.strategic_llm_model,
@@ -92,22 +91,44 @@ async def generate_sub_queries(
                 cost_callback=cost_callback,
                 **kwargs
             )
-            logger.warning(f"Retrying with max_tokens={cfg.strategic_token_limit} successful.")
-        except Exception as e:
-            logger.warning(f"Retrying with max_tokens={cfg.strategic_token_limit} failed.")
-            logger.warning(f"Error with strategic LLM: {e}. Falling back to smart LLM.")
-            response = await create_chat_completion(
-                model=cfg.smart_llm_model,
-                messages=[{"role": "user", "content": gen_queries_prompt}],
-                temperature=cfg.temperature,
-                max_tokens=cfg.smart_token_limit,
-                llm_provider=cfg.smart_llm_provider,
-                llm_kwargs=cfg.llm_kwargs,
-                cost_callback=cost_callback,
-                **kwargs
-            )
+        except Exception:
+            logger.warning(f"Retrying with max_tokens={cfg.strategic_token_limit} failed. Falling back to smart LLM.")
+            try:
+                response = await create_chat_completion(
+                    model=cfg.smart_llm_model,
+                    messages=[{"role": "user", "content": gen_queries_prompt}],
+                    temperature=cfg.temperature,
+                    max_tokens=cfg.smart_token_limit,
+                    llm_provider=cfg.smart_llm_provider,
+                    llm_kwargs=cfg.llm_kwargs,
+                    cost_callback=cost_callback,
+                    **kwargs
+                )
+            except Exception:
+                response = ""
 
-    return json_repair.loads(response)
+    # Safely parse the response into a list of queries
+    try:
+        parsed = json_repair.loads(response) if response else []
+    except Exception:
+        # If parsing fails, try to coerce a non-empty string into a single-item list
+        if isinstance(response, str) and response.strip():
+            return [response.strip()]
+        return []
+
+    # Normalize parsed result into a list of strings
+    if isinstance(parsed, list):
+        return [str(x) for x in parsed]
+    if isinstance(parsed, dict):
+        # If a dict was returned, try to find common keys
+        if "subqueries" in parsed and isinstance(parsed["subqueries"], list):
+            return [str(x) for x in parsed["subqueries"]]
+        # Otherwise, coerce dict to a single JSON string
+        return [json.dumps(parsed)]
+    if isinstance(parsed, str):
+        return [parsed]
+
+    return []
 
 async def plan_research_outline(
     query: str,

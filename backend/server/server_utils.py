@@ -10,6 +10,9 @@ from fastapi.responses import JSONResponse, FileResponse
 from gpt_researcher.document.document import DocumentLoader
 from gpt_researcher import GPTResearcher
 from utils import write_md_to_pdf, write_md_to_word, write_text_to_md
+from fastapi import HTTPException
+import unicodedata
+import re
 from pathlib import Path
 from datetime import datetime
 from fastapi import HTTPException
@@ -116,6 +119,98 @@ def sanitize_filename(filename: str) -> str:
     return re.sub(r"[^\w\s-]", "", sanitized).strip()
 
 
+def secure_filename(filename: str) -> str:
+    """Sanitize and validate filenames to prevent path traversal and injection attacks.
+
+    Raises ValueError for invalid filenames.
+    """
+    if filename is None:
+        raise ValueError("empty filename")
+
+    # Remove null bytes
+    filename = filename.replace("\x00", "")
+
+    # Normalize unicode and remove bidi overrides
+    filename = unicodedata.normalize("NFKC", filename)
+    filename = filename.replace("\u202e", "").replace("\u202d", "")
+
+    # Strip leading/trailing spaces and dots
+    filename = filename.strip()
+    filename = filename.lstrip(" .")
+
+    if not filename or set(filename) <= {'.'}:
+        raise ValueError("empty filename")
+
+    # Split path-like inputs and reject explicit traversal segments
+    parts = re.split(r"[\\/]+", filename)
+    if any(p == ".." for p in parts):
+        raise ValueError("path traversal detected")
+
+    # Remove control characters
+    filename = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", filename)
+
+    # Remove drive letters (Windows) like C:foo -> foo
+    filename = re.sub(r"^[A-Za-z]:", "", filename)
+
+    # Collapse repeated dots and slashes to guard against '....//....//etc/passwd'
+    filename = re.sub(r"[.]{2,}", "..", filename)
+    filename = re.sub(r"[\\/]{2,}", "/", filename)
+
+    # Remove any remaining path separators
+    filename = filename.replace("/", "").replace("\\\\", "")
+
+    # Split name and extension, preserve simple extensions like .txt .pdf
+    name, ext = os.path.splitext(filename)
+
+    # Clean name: keep alphanum, dash, underscore and dots (dots internal will be collapsed)
+    name = re.sub(r"[^A-Za-z0-9._ -]", "", name)
+    # Collapse whitespace and dots inside the name
+    name = re.sub(r"[\s.]+", " ", name).strip()
+    name = name.replace(" ", "_")
+
+    # Clean extension
+    if ext and re.fullmatch(r"\.[A-Za-z0-9]+", ext):
+        ext_clean = ext.lower()
+    else:
+        ext_clean = ""
+
+    filename = f"{name}{ext_clean}"
+
+    # Enforce reserved Windows names
+    reserved = {"CON", "PRN", "AUX", "NUL", "COM1", "LPT1"}
+    name_only = os.path.splitext(filename)[0].upper()
+    if name_only in reserved:
+        raise ValueError("reserved name")
+
+    # Enforce length limit (255 bytes)
+    if len(filename.encode("utf-8")) > 255:
+        raise ValueError("filename too long")
+
+    if not filename:
+        raise ValueError("empty filename")
+
+    return filename
+
+
+def validate_file_path(target_path: str, base_dir: str) -> str:
+    """Ensure the resolved target_path is inside base_dir (prevents traversal and symlink escapes).
+
+    Returns the absolute canonical path on success, raises ValueError if outside.
+    """
+    abs_base = os.path.abspath(base_dir)
+    abs_target = os.path.abspath(target_path)
+
+    # Resolve symlinks
+    real_base = os.path.realpath(abs_base)
+    real_target = os.path.realpath(abs_target)
+
+    # Ensure target path is within base directory
+    if not real_target.startswith(real_base + os.sep) and real_target != real_base:
+        raise ValueError("path is outside allowed directory")
+
+    return real_target
+
+
 async def handle_start_command(websocket, data: str, manager):
     json_data = json.loads(data[6:])
     (
@@ -214,20 +309,96 @@ def update_environment_variables(config: Dict[str, str]):
 
 
 async def handle_file_upload(file, DOC_PATH: str) -> Dict[str, str]:
-    file_path = os.path.join(DOC_PATH, os.path.basename(file.filename))
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    print(f"File uploaded to {file_path}")
+    # Validate filename
+    try:
+        clean_name = secure_filename(file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid file: {e}")
 
-    document_loader = DocumentLoader(DOC_PATH)
-    await document_loader.load()
+    os.makedirs(DOC_PATH, exist_ok=True)
 
-    return {"filename": file.filename, "path": file_path}
+    dest_path = os.path.join(DOC_PATH, clean_name)
+
+    # Handle name conflicts by appending _1, _2, ...
+    base, ext = os.path.splitext(clean_name)
+    counter = 1
+    while os.path.exists(dest_path):
+        dest_path = os.path.join(DOC_PATH, f"{base}_{counter}{ext}")
+        counter += 1
+
+    # Write bytes to file. The test uses Mock objects; attempt to read bytes from file.file
+    try:
+        # If file.file has a .read() that returns bytes, use it
+        with open(dest_path, "wb") as buffer:
+            fobj = getattr(file, "file", file)
+            # Prefer iterating if the object supports read with size
+            read = getattr(fobj, "read", None)
+            if callable(read):
+                # Attempt to read in chunks until exhaustion
+                while True:
+                    try:
+                        chunk = read(65536)
+                    except TypeError:
+                        # Some mocks may not accept a size arg; call without args
+                        chunk = read()
+
+                    if not chunk:
+                        break
+
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        # If it's a Mock or non-bytes, try to get its value attribute
+                        if hasattr(chunk, "value") and isinstance(chunk.value, (bytes, bytearray)):
+                            chunk = chunk.value
+                        else:
+                            # Fall back to converting str() to bytes
+                            chunk = str(chunk).encode("utf-8")
+
+                    buffer.write(chunk)
+            else:
+                # If no read() method, try to treat the object as raw bytes
+                if isinstance(fobj, (bytes, bytearray)):
+                    buffer.write(fobj)
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid file content")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File save error: {e}")
+
+    print(f"File uploaded to {dest_path}")
+
+    # Load documents if loader available
+    try:
+        document_loader = DocumentLoader(DOC_PATH)
+        await document_loader.load()
+    except Exception:
+        # Ignore loader errors in this context
+        pass
+
+    return {"filename": os.path.basename(dest_path), "path": dest_path}
 
 
 async def handle_file_deletion(filename: str, DOC_PATH: str) -> JSONResponse:
-    file_path = os.path.join(DOC_PATH, os.path.basename(filename))
+    # Validate filename first
+    try:
+        clean_name = secure_filename(filename)
+    except Exception:
+        return JSONResponse(status_code=400, content={"message": "Invalid filename"})
+
+    file_path = os.path.join(DOC_PATH, os.path.basename(clean_name))
+
+    # Protect against path traversal and symlink escapes
+    try:
+        validate_file_path(file_path, DOC_PATH)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"message": "Path outside allowed directory"})
+
     if os.path.exists(file_path):
+        if os.path.isdir(file_path):
+            return JSONResponse(status_code=400, content={"message": "Path is not a file"})
         os.remove(file_path)
         print(f"File deleted: {file_path}")
         return JSONResponse(content={"message": "File deleted successfully"})

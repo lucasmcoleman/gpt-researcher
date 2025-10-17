@@ -76,6 +76,10 @@ async def handle_json_error(response):
 
 
 def extract_json_with_regex(response):
+    # Be defensive: response may be None or not a string
+    if response is None or not isinstance(response, (str, bytes)):
+        return None
+
     json_match = re.search(r"{.*?}", response, re.DOTALL)
     if json_match:
         return json_match.group(0)
