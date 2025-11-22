@@ -6,7 +6,7 @@ from ..actions.utils import stream_output
 from ..actions.query_processing import plan_research_outline, get_search_results
 from ..document import DocumentLoader, OnlineDocumentLoader, LangChainDocumentLoader
 from ..utils.enum import ReportSource, ReportType
-from ..utils.logging_config import get_json_handler
+from ..utils.logging_config import get_json_handler, setup_research_logging
 from ..actions.agent_creator import choose_agent
 
 
@@ -16,7 +16,14 @@ class ResearchConductor:
     def __init__(self, researcher):
         self.researcher = researcher
         self.logger = logging.getLogger('research')
-        self.json_handler = get_json_handler()
+        # Ensure research logging is set up so log and json files are created
+        try:
+            log_file, json_file, research_logger, json_handler = setup_research_logging()
+            # attach json handler to logger for downstream code to access
+            research_logger.json_handler = json_handler
+            self.json_handler = json_handler
+        except Exception:
+            self.json_handler = get_json_handler()
         # Add cache for MCP results to avoid redundant calls
         self._mcp_results_cache = None
         # Track MCP query count for balanced mode

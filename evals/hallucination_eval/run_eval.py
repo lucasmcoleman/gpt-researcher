@@ -115,7 +115,18 @@ class ResearchEvaluator:
             
         # Use the final combined context as source text
         source_text = research_data.get("context", "")
-        
+
+        # Normalize source_text to a string (the judges API expects a string or list of strings)
+        if isinstance(source_text, list):
+            # Join list items into a single string, coercing non-strings
+            source_text = "\n\n".join([s if isinstance(s, str) else str(s) for s in source_text])
+        elif isinstance(source_text, dict):
+            # If it's a dict, try to extract a common content field, else JSON-serialize
+            source_text = source_text.get("content") or source_text.get("text") or json.dumps(source_text)
+        else:
+            # Coerce other types to string
+            source_text = str(source_text) if source_text is not None else ""
+
         if not source_text:
             logger.warning("No source text found in research results - skipping evaluation")
             eval_result = {
